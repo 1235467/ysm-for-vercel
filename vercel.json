@@ -1,0 +1,8 @@
+{
+  "rewrites": [
+    {
+      "source": "/api/:match*",
+      "destination": "https://ncmapi-bdvw47yx4-qq2007-outlookcom.vercel.app/:match*"
+    }
+  ]
+}
