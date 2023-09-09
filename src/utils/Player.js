@@ -3,7 +3,7 @@ import { getArtist } from '@/api/artist';
 import { trackScrobble, trackUpdateNowPlaying } from '@/api/lastfm';
 import { fmTrash, personalFM } from '@/api/others';
 import { getPlaylistDetail, intelligencePlaylist } from '@/api/playlist';
-import { getMP3, getTrackDetail, scrobble } from '@/api/track';
+import { getLyric, getMP3, getTrackDetail, scrobble } from '@/api/track';
 import store from '@/store';
 import { isAccountLoggedIn } from '@/utils/auth';
 import { cacheTrackSource, getTrackSource } from '@/utils/db';
@@ -13,6 +13,17 @@ import shuffle from 'lodash/shuffle';
 import { decode as base642Buffer } from '@/utils/base64';
 
 const PLAY_PAUSE_FADE_DURATION = 200;
+
+const INDEX_IN_PLAY_NEXT = -1;
+
+/**
+ * @readonly
+ * @enum {string}
+ */
+const UNPLAYABLE_CONDITION = {
+  PLAY_NEXT_TRACK: 'playNextTrack',
+  PLAY_PREV_TRACK: 'playPrevTrack',
+};
 
 const electron =
   process.env.IS_ELECTRON === true ? window.require('electron') : null;
@@ -137,7 +148,7 @@ export default class {
   }
   set volume(volume) {
     this._volume = volume;
-    Howler.volume(volume);
+    this._howler?.volume(volume);
   }
   get list() {
     return this.shuffle ? this._shuffledList : this._list;
@@ -164,6 +175,9 @@ export default class {
   get currentTrack() {
     return this._currentTrack;
   }
+  get currentTrackID() {
+    return this._currentTrack?.id ?? 0;
+  }
   get playlistSource() {
     return this._playlistSource;
   }
@@ -187,6 +201,9 @@ export default class {
   set progress(value) {
     if (this._howler) {
       this._howler.seek(value);
+      if (isCreateMpris) {
+        ipcRenderer?.send('seeked', this._howler.seek());
+      }
     }
   }
   get isCurrentTrackLiked() {
@@ -195,11 +212,11 @@ export default class {
 
   _init() {
     this._loadSelfFromLocalStorage();
-    Howler.volume(this.volume);
+    this._howler?.volume(this.volume);
 
     if (this._enabled) {
       // 恢复当前播放歌曲
-      this._replaceCurrentTrack(this._currentTrack.id, false).then(() => {
+      this._replaceCurrentTrack(this.currentTrackID, false).then(() => {
         this._howler?.seek(localStorage.getItem('playerCurrentTrackTime') ?? 0);
       }); // update audio source and init howler
       this._initMediaSession();
@@ -243,8 +260,8 @@ export default class {
     const next = this._reversed ? this.current - 1 : this.current + 1;
 
     if (this._playNextList.length > 0) {
-      let trackID = this._playNextList.shift();
-      return [trackID, this.current];
+      let trackID = this._playNextList[0];
+      return [trackID, INDEX_IN_PLAY_NEXT];
     }
 
     // 循环模式开启，则重新播放当前模式下的相对的下一首
@@ -278,7 +295,7 @@ export default class {
     // 返回 [trackID, index]
     return [this.list[next], next];
   }
-  async _shuffleTheList(firstTrackID = this._currentTrack.id) {
+  async _shuffleTheList(firstTrackID = this.currentTrackID) {
     let list = this._list.filter(tid => tid !== firstTrackID);
     if (firstTrackID === 'first') list = this._list;
     this._shuffledList = shuffle(list);
@@ -320,6 +337,29 @@ export default class {
       onend: () => {
         this._nextTrackCallback();
       },
+    });
+    this._howler.on('loaderror', (_, errCode) => {
+      // https://developer.mozilla.org/en-US/docs/Web/API/MediaError/code
+      // code 3: MEDIA_ERR_DECODE
+      if (errCode === 3) {
+        this._playNextTrack(this._isPersonalFM);
+      } else if (errCode === 4) {
+        // code 4: MEDIA_ERR_SRC_NOT_SUPPORTED
+        store.dispatch('showToast', `无法播放: 不支持的音频格式`);
+        this._playNextTrack(this._isPersonalFM);
+      } else {
+        const t = this.progress;
+        this._replaceCurrentTrackAudio(this.currentTrack, false, false).then(
+          replaced => {
+            // 如果 replaced 为 false，代表当前的 track 已经不是这里想要替换的track
+            // 此时则不修改当前的歌曲进度
+            if (replaced) {
+              this._howler?.seek(t);
+              this.play();
+            }
+          }
+        );
+      }
     });
     if (autoplay) {
       this.play();
@@ -401,12 +441,11 @@ export default class {
       }
     };
 
-    /** @type {import("@unblockneteasemusic/rust-napi").RetrievedSongInfo | null} */
     const retrieveSongInfo = await ipcRenderer.invoke(
       'unblock-music',
       store.state.settings.unmSource,
       track,
-      /** @type {import("@unblockneteasemusic/rust-napi").Context} */ ({
+      {
         enableFlac: store.state.settings.unmEnableFlac || null,
         proxyUri: store.state.settings.unmProxyUri || null,
         searchMode: determineSearchMode(store.state.settings.unmSearchMode),
@@ -415,7 +454,7 @@ export default class {
           'qq:cookie': store.state.settings.unmQQCookie || null,
           'ytdl:exe': store.state.settings.unmYtDlExe || null,
         },
-      })
+      }
     );
 
     if (store.state.settings.automaticallyCacheSongs && retrieveSongInfo?.url) {
@@ -452,33 +491,61 @@ export default class {
   _replaceCurrentTrack(
     id,
     autoplay = true,
-    ifUnplayableThen = 'playNextTrack'
+    ifUnplayableThen = UNPLAYABLE_CONDITION.PLAY_NEXT_TRACK
   ) {
     if (autoplay && this._currentTrack.name) {
       this._scrobble(this.currentTrack, this._howler?.seek());
     }
     return getTrackDetail(id).then(data => {
-      let track = data.songs[0];
+      const track = data.songs[0];
       this._currentTrack = track;
       this._updateMediaSessionMetaData(track);
-      return this._getAudioSource(track).then(source => {
-        if (source) {
+      return this._replaceCurrentTrackAudio(
+        track,
+        autoplay,
+        true,
+        ifUnplayableThen
+      );
+    });
+  }
+  /**
+   * @returns 是否成功加载音频，并使用加载完成的音频替换了howler实例
+   */
+  _replaceCurrentTrackAudio(
+    track,
+    autoplay,
+    isCacheNextTrack,
+    ifUnplayableThen = UNPLAYABLE_CONDITION.PLAY_NEXT_TRACK
+  ) {
+    return this._getAudioSource(track).then(source => {
+      if (source) {
+        let replaced = false;
+        if (track.id === this.currentTrackID) {
           this._playAudioSource(source, autoplay);
-          this._cacheNextTrack();
-          return source;
-        } else {
-          store.dispatch('showToast', `无法播放 ${track.name}`);
-          if (ifUnplayableThen === 'playNextTrack') {
-            if (this.isPersonalFM) {
-              this.playNextFMTrack();
-            } else {
-              this.playNextTrack();
-            }
-          } else {
-            this.playPrevTrack();
-          }
+          replaced = true;
         }
-      });
+        if (isCacheNextTrack) {
+          this._cacheNextTrack();
+        }
+        return replaced;
+      } else {
+        store.dispatch('showToast', `无法播放 ${track.name}`);
+        switch (ifUnplayableThen) {
+          case UNPLAYABLE_CONDITION.PLAY_NEXT_TRACK:
+            this._playNextTrack(this.isPersonalFM);
+            break;
+          case UNPLAYABLE_CONDITION.PLAY_PREV_TRACK:
+            this.playPrevTrack();
+            break;
+          default:
+            store.dispatch(
+              'showToast',
+              `undefined Unplayable condition: ${ifUnplayableThen}`
+            );
+            break;
+        }
+        return false;
+      }
     });
   }
   _cacheNextTrack() {
@@ -511,11 +578,7 @@ export default class {
         this.playPrevTrack();
       });
       navigator.mediaSession.setActionHandler('nexttrack', () => {
-        if (this.isPersonalFM) {
-          this.playNextFMTrack();
-        } else {
-          this.playNextTrack();
-        }
+        this._playNextTrack(this.isPersonalFM);
       });
       navigator.mediaSession.setActionHandler('stop', () => {
         this.pause();
@@ -557,12 +620,34 @@ export default class {
       ],
       length: this.currentTrackDuration,
       trackId: this.current,
+      url: '/trackid/' + track.id,
     };
 
     navigator.mediaSession.metadata = new window.MediaMetadata(metadata);
     if (isCreateMpris) {
-      ipcRenderer?.send('metadata', metadata);
+      this._updateMprisState(track, metadata);
     }
+  }
+  // OSDLyrics 会检测 Mpris 状态并寻找对应歌词文件，所以要在更新 Mpris 状态之前保证歌词下载完成
+  async _updateMprisState(track, metadata) {
+    if (!store.state.settings.enableOsdlyricsSupport) {
+      return ipcRenderer?.send('metadata', metadata);
+    }
+
+    let lyricContent = await getLyric(track.id);
+
+    if (!lyricContent.lrc || !lyricContent.lrc.lyric) {
+      return ipcRenderer?.send('metadata', metadata);
+    }
+
+    ipcRenderer.send('sendLyrics', {
+      track,
+      lyrics: lyricContent.lrc.lyric,
+    });
+
+    ipcRenderer.on('saveLyricFinished', () => {
+      ipcRenderer?.send('metadata', metadata);
+    });
   }
   _updateMediaSessionPositionState() {
     if ('mediaSession' in navigator === false) {
@@ -579,11 +664,9 @@ export default class {
   _nextTrackCallback() {
     this._scrobble(this._currentTrack, 0, true);
     if (!this.isPersonalFM && this.repeatMode === 'one') {
-      this._replaceCurrentTrack(this._currentTrack.id);
-    } else if (this.isPersonalFM) {
-      this.playNextFMTrack();
+      this._replaceCurrentTrack(this.currentTrackID);
     } else {
-      this.playNextTrack();
+      this._playNextTrack(this.isPersonalFM);
     }
   }
   _loadPersonalFMNextTrack() {
@@ -628,11 +711,14 @@ export default class {
     }
     ipcRenderer?.send('pauseDiscordPresence', track);
   }
-
-  currentTrackID() {
-    const { list, current } = this._getListAndCurrent();
-    return list[current];
+  _playNextTrack(isPersonal) {
+    if (isPersonal) {
+      this.playNextFMTrack();
+    } else {
+      this.playNextTrack();
+    }
   }
+
   appendTrack(trackID) {
     this.list.append(trackID);
   }
@@ -644,7 +730,12 @@ export default class {
       this._setPlaying(false);
       return false;
     }
-    this.current = index;
+    let next = index;
+    if (index === INDEX_IN_PLAY_NEXT) {
+      this._playNextList.shift();
+      next = this.current;
+    }
+    this.current = next;
     this._replaceCurrentTrack(trackID);
     return true;
   }
@@ -697,7 +788,11 @@ export default class {
     const [trackID, index] = this._getPrevTrack();
     if (trackID === undefined) return false;
     this.current = index;
-    this._replaceCurrentTrack(trackID, true, 'playPrevTrack');
+    this._replaceCurrentTrack(
+      trackID,
+      true,
+      UNPLAYABLE_CONDITION.PLAY_PREV_TRACK
+    );
     return true;
   }
   saveSelfToLocalStorage() {
@@ -751,11 +846,14 @@ export default class {
       this.play();
     }
   }
-  seek(time = null) {
+  seek(time = null, sendMpris = true) {
+    if (isCreateMpris && sendMpris && time) {
+      ipcRenderer?.send('seeked', time);
+    }
     if (time !== null) {
       this._howler?.seek(time);
       if (this._playing)
-        this._playDiscordPresence(this._currentTrack, this.seek());
+        this._playDiscordPresence(this._currentTrack, this.seek(null, false));
     }
     return this._howler === null ? 0 : this._howler.seek();
   }
@@ -838,20 +936,14 @@ export default class {
   addTrackToPlayNext(trackID, playNow = false) {
     this._playNextList.push(trackID);
     if (playNow) {
-      if (this.isPersonalFM) {
-        this.playNextFMTrack();
-      } else {
-        this.playNextTrack();
-      }
+      this.playNextTrack();
     }
   }
   playPersonalFM() {
     this._isPersonalFM = true;
     if (!this._enabled) this._enabled = true;
-    if (this._currentTrack.id !== this._personalFMTrack.id) {
-      this._replaceCurrentTrack(this._personalFMTrack.id).then(() =>
-        this.playOrPause()
-      );
+    if (this.currentTrackID !== this._personalFMTrack.id) {
+      this._replaceCurrentTrack(this._personalFMTrack.id, true);
     } else {
       this.playOrPause();
     }

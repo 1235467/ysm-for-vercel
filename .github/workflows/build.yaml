@@ -17,11 +17,11 @@ jobs:
 
     strategy:
       matrix:
-        os: [macos-latest, windows-latest, ubuntu-18.04]
+        os: [macos-latest, windows-latest, ubuntu-22.04]
 
     steps:
       - name: Check out Git repository
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
         with:
           submodules: "recursive"
 
@@ -36,7 +36,7 @@ jobs:
         run: |
           sudo apt-get update &&
           sudo apt-get install --no-install-recommends -y rpm &&
-          sudo apt-get install --no-install-recommends -y bsdtar &&
+          sudo apt-get install --no-install-recommends -y libarchive-tools &&
           sudo apt-get install --no-install-recommends -y libopenjp2-tools
 
       - name: Install Snapcraft (on Ubuntu)
@@ -96,19 +96,19 @@ jobs:
 
           use_vue_cli: true
 
-      - uses: actions/upload-artifact@v2
+      - uses: actions/upload-artifact@v3
         with:
           name: YesPlayMusic-mac
           path: dist_electron/*-universal.dmg
           if-no-files-found: ignore
 
-      - uses: actions/upload-artifact@v2
+      - uses: actions/upload-artifact@v3
         with:
           name: YesPlayMusic-win
           path: dist_electron/*Setup*.exe
           if-no-files-found: ignore
 
-      - uses: actions/upload-artifact@v2
+      - uses: actions/upload-artifact@v3
         with:
           name: YesPlayMusic-linux
           path: dist_electron/*.AppImage
